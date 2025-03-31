@@ -24,6 +24,11 @@ from transformers import Qwen2VLForConditionalGeneration
 from math_verify import parse, verify
 from open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainer, Qwen2VLGRPOVLLMTrainerModified
 from trl import GRPOConfig, GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from PIL import Image
+import io
+from datasets import Image as HFImage
+from torch.optim import AdamW
+from transformers.optimization import get_cosine_schedule_with_warmup
 
 
 @dataclass
@@ -55,7 +60,8 @@ def accuracy_reward(completions, solution, **kwargs):
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    for content, sol in zip(contents, solution):
+    # print("solution:", solution)
+    for idx, (content, sol) in enumerate(zip(contents, solution)):
         reward = 0.0
         # Try symbolic verification first
         try:
@@ -69,11 +75,13 @@ def accuracy_reward(completions, solution, **kwargs):
         if reward == 0.0:
             try:
                 # Extract answer from solution if it has think/answer tags
-                sol_match = re.search(r'<answer>(.*?)</answer>', sol)
+                # print("sol:", sol)
+                sol_match = re.search(r'<answer>(.*?)</answer>', sol, re.DOTALL)
                 ground_truth = sol_match.group(1).strip() if sol_match else sol.strip()
-                
+                if ground_truth == "":
+                    ground_truth = sol.strip()
                 # Extract answer from content if it has think/answer tags
-                content_match = re.search(r'<answer>(.*?)</answer>', content)
+                content_match = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
                 student_answer = content_match.group(1).strip() if content_match else content.strip()
                 
                 # Compare the extracted answers
@@ -86,10 +94,14 @@ def accuracy_reward(completions, solution, **kwargs):
         if os.getenv("DEBUG_MODE") == "true":
             log_path = os.getenv("LOG_PATH")
             # local_rank = int(os.getenv("LOCAL_RANK", 0))
-            with open(log_path, "a") as f:
+            with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
                 f.write(f"Content: {content}\n")
                 f.write(f"Solution: {sol}\n")
+                # Log image URL if available in kwargs
+                if "image_url" in kwargs and idx < len(kwargs["image_url"]):
+                    f.write(f"Image URL: {kwargs['image_url'][idx]}\n")
+                f.write("-" * 50 + "\n")
     return rewards
 
 
@@ -120,6 +132,51 @@ def main(script_args, training_args, model_args):
 
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    print("Using dataset: ", script_args.dataset_name)
+    if script_args.dataset_name == "AI4Math/MathVista":
+        script_args.dataset_train_split = "testmini"
+        script_args.dataset_test_split = "no"
+
+        #keep only the required columns for the dataset and rename them only include if the answer_type not "free_form"
+        print("Modifying the dataset")
+        # dataset = dataset.filter(lambda x: x["answer_type"] != "free_form")
+        # print("Sample answer:", sample["answer"])
+        # use_image = True
+        dataset = dataset.map(
+            lambda x: {
+                "problem": x["question"] if x["choices"] is None else x["question"] + " Choose from the following options " + " ".join(x["choices"]),
+                "solution": x["answer"],
+                #use the decoded_image if use_image is true, otherwise use create a dummy blank image
+                # "image": x["decoded_image"] if use_image else Image.new("RGB", (256, 256), (255, 255, 255)),
+                #use the decoded_image for the image if the dimensions are valid, otherwise skip the image
+                "image": x["decoded_image"] if (x["decoded_image"].width > 28 and x["decoded_image"].height > 28) else None,
+                "image_url": x["image"] # for debug
+            }
+        )
+        dataset = dataset.cast_column("image", HFImage())
+        dataset = dataset.filter(lambda x: x["image"] is not None)
+        
+        print("Dataset modified")
+
+        required_columns = ["problem", "solution", "image_url", "image"]
+        for split in dataset.keys():
+            for column in dataset[split].column_names:
+                if column not in required_columns:
+                    dataset[split] = dataset[split].remove_columns(column)
+
+        print("Dataset splits:", list(dataset.keys()))
+        print("Columns in test split:", dataset["test"].column_names)
+        print("Dataset splits:", list(dataset.keys()))
+        print("Dataset features (test split):", dataset["test"].column_names)
+        print("Dataset Size (test split):", len(dataset["test"]))
+        print("Dataset Size (testmini split):", len(dataset["testmini"]))
+        sample = dataset[script_args.dataset_train_split][0]
+        print("Sample problem:", sample["problem"])
+        # print(type(sample["image"])) 
+        # if isinstance(sample["image"], dict):
+        #     print("image is dict")
+        #     print(sample["image"].keys())
+        print("solution:", sample["solution"])
 
 
     # Format into conversation
@@ -131,19 +188,19 @@ def main(script_args, training_args, model_args):
             ],
         }
 
-    # def make_conversation_image(example):
-    #     return {
-    #         "prompt": [
-    #             {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
-    #             {
-    #                 "role": "user",
-    #                 "content": [
-    #                     {"type": "image"},
-    #                     {"type": "text", "text": example["problem"]},
-    #                 ],
-    #             },
-    #         ],
-    #     }
+    def make_conversation_image(example):
+        return {
+            "prompt": [
+                {"role": "system", "content": [{"type": "text", "text": SYSTEM_PROMPT}]},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": example["problem"]},
+                    ],
+                },
+            ],
+        }
 
     QUESTION_TEMPLATE = "{Question}  Output the thinking process in <think> </think> and final answer (number) in <answer> </answer> tags."
 
@@ -169,11 +226,22 @@ def main(script_args, training_args, model_args):
     else:
         print("no image in dataset")
         dataset = dataset.map(make_conversation)
-        dataset = dataset.remove_columns("messages")
+        dataset = dataset.remove_columns("messages") if "messages" in dataset[script_args.dataset_train_split].features else dataset
 
     
     trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
     print("using: ", trainer_cls)
+
+    #setup cosine learning rate scheduler
+    # if training_args.learning_rate is not None:
+    #     lr_scheduler = get_cosine_schedule_with_warmup(
+    #         optimizer=optimizer,
+    #         num_warmup_steps=training_args.warmup_steps,
+    #         num_training_steps=training_args.max_steps,
+    #     )
+    # else:
+    #     lr_scheduler = None
+    #     optimizer = None
 
     # Initialize the GRPO trainer
     trainer = trainer_cls(
@@ -186,6 +254,7 @@ def main(script_args, training_args, model_args):
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
+        # optimizers=(optimizer, lr_scheduler),
     )
 
     # Train and push the model to the Hub

@@ -701,6 +701,9 @@ class Qwen2VLGRPOVLLMTrainer(Trainer):
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
+
+                if "image_url" in inputs[0]:
+                    reward_kwargs["image_url"] = [example["image_url"] for example in inputs for _ in range(self.num_generations)]
                 output_reward_func = reward_func(
                     prompts=prompts, completions=completions, **reward_kwargs
                 )

@@ -45,6 +45,7 @@ from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_c
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
+from transformers import AutoConfig
 
 import copy
 
@@ -203,9 +204,49 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
                     "This argument can only be used when the `model` argument is a string."
                 )
+        # if isinstance(model, str):
+        #     model_id = model
+        #     config = AutoConfig.from_pretrained(model_id)
+        #     config_class_name = config.__class__.__name__
+            
+        #     if "Qwen2VLConfig" in config_class_name:
+        #         print(f"Loading Qwen2VL model from {model_id}")
+        #         model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     elif "Qwen2_5_VLConfig" in config_class_name:
+        #         print(f"Loading Qwen2.5VL model from {model_id}")
+        #         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     elif "AriaConfig" in config_class_name:
+        #         print(f"Loading Aria model from {model_id}")
+        #         model_init_kwargs.pop("use_cache", None)
+        #         model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     else:
+        #         print(f"Loading generic causal LM from {model_id} with config type {config_class_name}")
+        #         model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+        # else:
+        #     model_id = model.config._name_or_path
 
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
+
+        if processing_class is None:
+            config = AutoConfig.from_pretrained(model_id)
+            config_class_name = config.__class__.__name__
+            
+            if "Qwen2VLConfig" in config_class_name or "Qwen2_5_VLConfig" in config_class_name or "AriaConfig" in config_class_name:
+                print(f"Loading processor for vision-language model: {model_id}")
+                processing_class = AutoProcessor.from_pretrained(model_id)
+                pad_token_id = processing_class.tokenizer.pad_token_id
+                processing_class.pad_token_id = pad_token_id
+                processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
+                if "Qwen" in config_class_name:
+                    processing_class.image_processor.max_pixels = max_pixels
+                    processing_class.image_processor.min_pixels = min_pixels
+            else:
+                print(f"Loading tokenizer for text-only model: {model_id}")
+                processing_class = AutoTokenizer.from_pretrained(model_id, padding_side="left")
+                pad_token_id = processing_class.pad_token_id
+
+
 
         # Reference model
         if is_deepspeed_zero3_enabled():
@@ -217,6 +258,19 @@ class Qwen2VLGRPOTrainer(Trainer):
                 self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             else:
                 self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+        # if is_deepspeed_zero3_enabled():
+        #     config = AutoConfig.from_pretrained(model_id)
+        #     config_class_name = config.__class__.__name__
+            
+        #     if "Qwen2VLConfig" in config_class_name:
+        #         self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     elif "Qwen2_5_VLConfig" in config_class_name:
+        #         self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     elif "AriaConfig" in config_class_name:
+        #         self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+        #     else:
+        #         self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
+
         elif peft_config is None:
             # If PEFT configuration is not provided, create a reference model based on the initial model.
             self.ref_model = create_reference_model(model)
@@ -358,7 +412,11 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
-        images = [x["image"] for x in inputs]
+        if "image" in inputs[0]:
+            images = [x["image"] for x in inputs]
+        else:
+            images = None
+        
         prompt_inputs = self.processing_class(
             text=prompts_text,
             images=images,
@@ -370,8 +428,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
 
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
-        pixel_values = prompt_inputs["pixel_values"]
-        image_grid_thw = prompt_inputs["image_grid_thw"]
+        pixel_values = prompt_inputs["pixel_values"] if "pixel_values" in prompt_inputs else None
+        image_grid_thw = prompt_inputs["image_grid_thw"] if "image_grid_thw" in prompt_inputs else None
 
         
         if self.max_prompt_length is not None:
@@ -446,6 +504,12 @@ class Qwen2VLGRPOTrainer(Trainer):
                     for example in inputs:
                         # Repeat each value in the column for `num_generations` times
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
+                # Add image URLs to reward kwargs if available
+                # print(inputs[0].keys()) 
+                if "image_url" in inputs[0]:
+                    reward_kwargs["image_url"] = [example["image_url"] for example in inputs for _ in range(self.num_generations)]
+                if "solution" in inputs[0]:
+                    reward_kwargs["solution"] = [example["solution"] for example in inputs for _ in range(self.num_generations)]
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
